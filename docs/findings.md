@@ -132,3 +132,52 @@ all_reduce        5.2%   （每层 2 次 × 48 层）
 2. MindIE 支持此模型后迁移（需 MindIE 适配 Qwen3-Next 混合架构）
 3. 减少 per-token 分发数：合并小算子（gating+l2norm+norm 融合）、C++ 化 GDN wrapper
 4. MTP 投机解码（需 0001 补丁重编）
+
+## 补充剖析：算子实现层确认（2026-11-20 下午）
+
+### 问题澄清：当前实现是 PyTorch 还是 AscendC？
+
+**混合**。逐层确认：
+
+| 组件 | 实现 | 调用方式 |
+|---|---|---|
+| GDN recurrent 核心计算 | **AscendC**（v310 定制算子） | `torch.ops._C_ascend.npu_recurrent_gated_delta_rule_310` → aclnnRecurrentGatedDeltaRuleV310 |
+| GDN causal_conv1d | **AscendC**（v310） | `torch.ops._C_ascend.npu_causal_conv1d_310` |
+| GDN chunk prefill (fwd_h) | **AscendC**（vllm 定制） | `torch.ops._C_ascend.chunk_gated_delta_rule_fwd_h_vllm` |
+| GDN chunk_fwd_o | **AscendC** | `torch.ops._C_ascend.chunk_fwd_o_vllm` |
+| GDN gating (decode) | **纯 PyTorch**（本项目替换） | `softmax+topk` |
+| GDN l2norm | 310P NPU 算子 | `torch_npu.npu_rms_norm`（借道实现） |
+| MoE gating | **纯 PyTorch** | softmax+topk |
+| MoE expert GEMM | 310P NPU 算子 | `torch_npu.npu_grouped_matmul` (aclnnGroupedMatmulV5) |
+| MoE token dispatch/combine | NPU 算子 | npu_moe_token_permute/unpermute |
+| attention | 310P NPU 算子 | paged attention (Compatibility backend) |
+| 各种 norm | NPU 算子 | rms_norm 系列 |
+
+`torch.ops._C_ascend` 经 `vllm_ascend_C.so` (TORCH_LIBRARY) 注册 **7 个 AscendC 算子**：
+npu_recurrent_gated_delta_rule_310 / npu_causal_conv1d_310 / chunk_gated_delta_rule_fwd_h_vllm / chunk_fwd_o_vllm / kda_gate_cumsum_vllm / kda_layout_swap12 / get_npu_view_from_cpu_tensor
+
+### msprof/torch_npu profiler 器械级数据（单算子 CPU/NPU 分解）
+
+**AscendC recurrent（单层 decode，50 次采样）**：
+- CPU wrapper（aclnn enqueue/host tiling/dispatch）: 3.0 ms → 60 us/次
+- device kernel 真实计算: 0.93 ms → **18.6 us/次**
+- 即 0.252 ms/次总耗时中 device 只占 7%，93% 是 CPU 侧！
+
+**grouped_matmul gmm1（10 experts, 100 次采样）**：
+- 真实 GEMM 计算: 4.37 ms → **43.7 us/次**
+- TransData 格式转换（ND→NZ）: 14.32 ms → **143 us/次** ← 比真计算大 3 倍！
+- CPU wrapper: 4.9 ms → 49 us/次
+- 310P 的 GroupedMatmulV5 强制走 TransData 预处理权重格式
+
+### 最终瓶颈链（每 token 288ms 的构成）
+
+1. **~1500 次 python→C++ 算子分发**（48 层 × 25-35 op）：调度+launch 为主
+2. **TransData 格式转换**：grouped_matmul 每层 2 次（gmm1/gmm2）× 48 层 ≈ 14ms/token 纯浪费
+3. **CPU 侧 aclnn wrapper**：每个 AscendC/aclnn 算子 50-60us 的 enqueue/host tiling
+4. AICore 利用率仅 1.8% —— device 算力严重过剩，纯 CPU 调度瓶颈
+
+### 与 Mixtral-8x7B(MindIE) 差距的本质
+
+MindIE/ATB 在加载时做**离线图编译 + 权重 NZ 预转换 + 算子融合**，运行时 CPU 只做极少量调度。
+vLLM-Ascend eager 模式则每 token 在 CPU 上走完整个 dispatcher→aclnn→enqueue 链。
+**这不是换一两个算子能解决的，是执行模型差异。**
