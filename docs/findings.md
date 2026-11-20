@@ -81,3 +81,54 @@ rtStreamEndCapture execution failed, reason=an error has invalidated the stream 
 | 16 并发 × 200tok | 51.1 tok/s 聚合（引擎峰值 56） |
 | 长输入 1462pt prefill+60tok gen | 11.2s |
 | prefix cache 二次请求 | 8.3s → 5.8s |
+
+## 性能剖析（2026-11-20）
+
+### 现象
+单请求 decode 288 ms/token（3.5 tok/s），但 **AICore 平均利用率仅 1.8%（峰值 7%）** —— NPU 几乎空转。
+
+### 微基准分解（单 rank，TP8 分片后形状）
+
+| 组件 | 单层耗时 | 层数 | 小计 |
+|---|---|---|---|
+| GDN recurrent（elemwise+sum） | 0.11 ms | 36 | 4.0 ms |
+| 标准注意力 decode @8K | 0.32 ms | 12 | 3.8 ms |
+| MoE 10-expert GEMM | 0.56 ms | 48 | 26.9 ms |
+| MoE gating（softmax+topk 512） | 0.17 ms | 48 | 8.2 ms |
+| Dense GEMM 2048² | 0.09 ms | 48 | 4.3 ms |
+| **理想合计** | | | **~47 ms** |
+
+组合 48 层 step 实测：**39.7 ms**（其中 CPU 提交 38.8ms，占 98%）。
+
+### 真实服务 vs 复现的差距
+
+复现只要 40ms，真实服务 288ms，差 7 倍。py-spy 采样（7971 样本）定位：
+
+```
+MoE 块           40.5%   （gating/dispatch/gmm1/gmm2/combine/sharedExpert/allreduce）
+GDN 块           40.8%   （l2norm/gating_pytorch/recurrent AscendC/norm/fix_qkv_order）
+all_reduce        5.2%   （每层 2 次 × 48 层）
+其余 linear/norm  ~14%
+```
+
+热点本质：**CPU 侧算子分发与框架开销**，不是算子执行。
+- 每 token 约 1200-1700 次 python→C++ 算子分发（48 层 × 25-35 算子）
+- 分发+launch+view/dtype 转换 ≈ 0.17-0.24 ms/次 → 288 ms
+- 310P 驱动栈的单次 launch 开销（~0.04ms 纯 launch + dispatcher 开销）放大了这一切
+
+### 为什么 Mixtral-8x7B 快
+
+| 维度 | Mixtral-8x7B | Qwen3-Next-80B |
+|---|---|---|
+| 推理框架 | MindIE 2.1.RC1（ATB 图引擎） | vLLM-Ascend eager |
+| 调度方式 | 全图编译、算子融合、极少 CPU 调度 | 每 token ~1500 次 python 算子分发 |
+| 架构 | 纯 attention + 8 experts | GDN 混合 + 512 experts |
+| MoE 复杂度 | 8 experts，dispatch 轻 | 512 experts，dispatch/permute/combine 重 |
+| 定制算子 | ATB 内置优化 | GDN AscendC 定制路径 + python wrapper 层厚 |
+
+**结论：不是某几个算子慢，而是 eager 模式下 CPU 调度开销主导（AICore 1.8% 证实）。**
+优化路径优先级：
+1. 算子级图优化 / torch.compile（受 aclgraph 与 GDN 回退冲突阻塞）
+2. MindIE 支持此模型后迁移（需 MindIE 适配 Qwen3-Next 混合架构）
+3. 减少 per-token 分发数：合并小算子（gating+l2norm+norm 融合）、C++ 化 GDN wrapper
+4. MTP 投机解码（需 0001 补丁重编）
