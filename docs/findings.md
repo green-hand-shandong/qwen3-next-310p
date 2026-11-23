@@ -246,3 +246,53 @@ E=512 FAIL（tokens=1/8 均崩）
   1. 给 CANN 提 issue：310P 适配 `moe_gating_top_k_softmax_v2`（v2 kernel 已有，只差 op-plugin 分发）—— 最正统
   2. 自行修改 310P kernel 加行分块循环，重编 built-in 算子包 —— 可行但要维护
   3. 我们已用的纯 torch softmax+topk 替代 —— 已生效，性能损耗可忽略（gating 只占 0.17ms/层）
+
+## 整体分析定稿：单请求慢的完整解释（2026-11-23）
+
+### 结论先行
+
+**单请求 3.7 tok/s 不是 Qwen3-Next 特有问题，是 vllm-ascend eager 模式在 310P 上的普遍水平。**
+参考：Qwen3-30B-A3B-w8a8（TP1，PIECEWISE graph）当年 TPOT 也有 163.7ms/token——换算每层 4.1ms，
+我们 48 层 270ms 每层 5.6ms，同一量级（我们多两次 all_reduce/层）。
+
+### 每 token 270ms 的完整构成（py-spy 60s@300Hz，7971+ 样本）
+
+| 类别 | 耗时 | 占比 | 说明 |
+|---|---|---|---|
+| 算子分发（OpOverloadPacket.__call__） | 69ms | 25.6% | ~1500 次 python→C++ |
+| GDN 全链 | 52ms | 19.1% | l2norm+gating+recurrent+conv+norm |
+| MoE 全链 | 32ms | 12.0% | gating+dispatch+gmm1/2+combine+shared |
+| linear 投影（QKV/O/gate/shared） | 26ms | 9.5% | 含 unquantized_gemm 7.4% |
+| all_reduce ×96 | 13ms | 4.8% | TP8 每层 2 次 |
+| norm ×144 | 12ms | 4.5% | GemmaRMSNorm310 |
+| 纯框架开销 | ~30ms | ~11% | Module._call_impl/__getattr__/dataclass init 等 |
+| 其他杂项 | ~35ms | ~13% | rope/split/sigmoid/silu/cache wrapper |
+
+### NPU 侧实测（decode 持续负载下）
+
+- AICore 利用率：5.3%（峰值 6%）——95% 时间在等 CPU
+- Memory BW：~2%——访存也远未饱和
+
+### 与 Qwen3-30B-A3B 当年 msprof 结论交叉验证（完全吻合）
+
+1. **host 下发是结构性热点**：它实测 launch node 1.94M 次，每层 host 下发 0.61ms 占 TPOT 18%；
+   单 stream 忙碌占空比仅 12.3%，AICore 排队空转远大于计算
+2. **decode 小 kernel 核并行度极低**：Block Num 只有 1~8（310P 有 20 个 AI Core），
+   glue kernel 串行占 1 个核跑 20~35us
+3. **所有 decode kernel 都是 MTE bound**：mac 利用率 2~3%，cube 几乎闲置
+4. **每个 aclnn 调用都要先查 workspace**（GetWorkspaceSize 成对出现）——graph 模式能省的大头
+
+### 为什么 micro-bench 只要 40ms 而真实服务 270ms
+
+micro-bench 每层只放了 ~10 个"干净"算子（无 view/dtype/contiguous/元数据构建）；
+真实模型每层 25-35 个算子 + 大量 python glue（qkv 重排、fix_query_key_value_ordering、
+mixed_qkv 拆分、tensor cache wrapper、dataclass 构建）。差值 = 这些 glue 的 CPU 时间。
+
+### 修复优先级（不考虑 MTP）
+
+1. **PIECEWISE graph 模式**（30B-A3B 生产配置验证过）：把 96 次 all_reduce、144 次 norm、
+   全部 aclnn workspace 查询烧进图，预计砍掉 40-60% CPU 开销 → **TPOT 有望从 270ms 降到 110-160ms**
+   - 风险：GDN conv1d 回退路径在 capture 时的兼容性（FULL 失败的原因），PIECEWISE 只 capture
+     attention+MoE 子图，GDN 段保持 eager，可能绕开
+2. **算子融合**：gating 链（当前 5-6 个算子）融合为 1 个 AscendC 算子
+3. **w8a8 量化**：权重搬运量减半，缓解 MTE bound
