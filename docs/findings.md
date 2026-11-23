@@ -296,3 +296,41 @@ mixed_qkv 拆分、tensor cache wrapper、dataclass 构建）。差值 = 这些 
      attention+MoE 子图，GDN 段保持 eager，可能绕开
 2. **算子融合**：gating 链（当前 5-6 个算子）融合为 1 个 AscendC 算子
 3. **w8a8 量化**：权重搬运量减半，缓解 MTE bound
+
+## 突破：PIECEWISE graph 模式跑通，decode 3.7 → 13 tok/s（3.5x）（2026-11-23）
+
+### 配置
+
+```bash
+--compilation-config '{"cudagraph_mode": "PIECEWISE", "cudagraph_capture_sizes": [1,2,4]}'
+--max-num-seqs 4
+```
+
+关键：vllm 0.32 的 `splitting_ops` 已内置 `qwen_gdn_attention_core` / `linear_attention`，
+GDN 核心被切出图外保持 eager，只有 attention+MoE 子图被 capture——这正是 30B-A3B 的生产模式。
+
+### 实测
+
+| 配置 | decode |
+|---|---|
+| eager（旧） | 3.7 tok/s |
+| **PIECEWISE batch≤4** | **13.0 tok/s（3.5x）** |
+| 首 token 延迟 | 858ms（与 eager 持平） |
+| 4 并发 | 42.4 tok/s |
+| ERROR | 0 |
+
+### batch>=8 capture 崩溃的限制
+
+`cudagraph_capture_sizes=[1,2,4,8,16]` 时 batch=8 的 capture 稳定触发 507903
+（stream capture 序列失效）。与 max-num-batched-tokens 无关（256/1024 都崩）。
+batch≤4 全部正常。疑似 310P driver 对 capture 图规模的限制（30B-A3B 记录里
+"TP>1 graph 捕获 event 资源不足" 同源）。
+
+### 对"怎么不用 eager"的完整回答
+
+310P 上 non-eager 的三个层级：
+1. **PIECEWISE cudagraph**（已跑通）✅ — vllm-ascend 原生支持，只 capture 非注意力子图
+2. FULL cudagraph — 被 GDN conv1d 回退路径阻塞（capture 时同步），除非 conv1d 出 AscendC 版
+3. torchair/npugraph_ex — 310P hardware profile 未支持（`npugraph_ex` capability 缺失）
+
+结论：PIECEWISE 是当前唯一可用且效果最好的 non-eager 方案。
