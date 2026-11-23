@@ -222,3 +222,27 @@ E=512 FAIL（tokens=1/8 均崩）
 1. **PIECEWISE graph 模式**：30B-A3B 的生产配置，Qwen3-Next 值得试（绕 FULL capture 对 conv1d 回退的敏感）
 2. **w8a8 量化**：Qwen3-30B-A3B-w8a8 单芯放得下，Qwen3-Next-80B w8a8 后 ~45GB，TP4 即可，还能减 TransData
 3. **MTP**：Qwen3-Next 权重自带 1553 个 mtp tensors（config 无显式字段，qwen3_next_mtp.py 直接读），仍是单请求延迟的正统解法
+
+## 补充：E=512 崩溃的根因定位（2026-11-23 续）
+
+### 不是"硬件锁"，是 310P 专用 kernel 的实现缺陷
+
+读了 CANN 自带的 kernel 源码（`opp/built-in/.../moe_gating_top_k_softmax/op_kernel/moe_gating_top_k_softmax_310p.h`）：
+
+- 整个 kernel 把**一整行（全部 expert logits）一次性搬进 UB**（`CopyIn: DataCopy(xLT, gmX_, rowWork_ * numCol_)`），无分块循环
+- `MAX_UB_SIZE = 245760`（240KB），减去 workspace 和 softmax/topk 中间缓冲后，单行容量上限实测在 **E≈466** 附近（464 OK，468 FAIL）
+- E=512 时一行 1KB fp16，加中间缓冲超 UB → MTE 写越界 → AICore 异常
+
+### 为什么说是"实现缺陷"而非硬件限制
+
+1. 310P 的 UB 物理上足够（240KB 远大于 1KB 一行），**只是这个 kernel 没写分行/分块逻辑**
+2. CANN 已有支持大 E 的 **v2 版本**（`moe_gating_top_k_softmax_v2`，含 REPEAT_MAX 分块检查），但 **op-plugin 未在 310P 上适配 v2**（调用即报错，与 Qwen3-30B-A3B 调优记录中"v2 未适配 310P"一致）
+3. 对比：910B 系列 UB 更大且 kernel 有分块，E=512 无压力
+
+### 结论
+
+- **软件层面被 CANN 的 310P kernel 实现卡住，不是硬件能力边界**
+- 修复路径（按成本）：
+  1. 给 CANN 提 issue：310P 适配 `moe_gating_top_k_softmax_v2`（v2 kernel 已有，只差 op-plugin 分发）—— 最正统
+  2. 自行修改 310P kernel 加行分块循环，重编 built-in 算子包 —— 可行但要维护
+  3. 我们已用的纯 torch softmax+topk 替代 —— 已生效，性能损耗可忽略（gating 只占 0.17ms/层）
