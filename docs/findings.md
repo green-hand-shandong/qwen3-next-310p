@@ -181,3 +181,44 @@ npu_recurrent_gated_delta_rule_310 / npu_causal_conv1d_310 / chunk_gated_delta_r
 MindIE/ATB 在加载时做**离线图编译 + 权重 NZ 预转换 + 算子融合**，运行时 CPU 只做极少量调度。
 vLLM-Ascend eager 模式则每 token 在 CPU 上走完整个 dispatcher→aclnn→enqueue 链。
 **这不是换一两个算子能解决的，是执行模型差异。**
+
+## 重大修正：npu_moe_gating_top_k_softmax 的真实边界（2026-11-23）
+
+### 修正之前结论
+
+之前二分测试（在同一进程内连续测试）得出"E=65 崩"，推断 64 上限。**这次用子进程隔离重测发现那是在受污染进程里的误报**。
+
+### 精确边界（子进程隔离，k=10）
+
+```
+E=64 OK | E=65~78 FAIL | E=80 OK | E=84~92 FAIL | E=96 OK
+E=104 FAIL | E=112 OK | E=120 FAIL | E=128 OK | E=160/192/256/320/384/448 OK
+E=512 FAIL（tokens=1/8 均崩）
+```
+
+**真实规律**：
+- E ≥ 80 且为 16 的倍数 → OK（80/96/112/128/160/192/256/320/384/448）
+- E ≤ 78 非 16 倍数 → FAIL（对齐要求）
+- **E=512 恰好超过 tile 容量硬上限（448 < 512）**
+
+### 对 Qwen3.5/3.8 系"支持好"的解释
+
+本机实际模型（README 记录）：
+- Qwen3-30B-A3B：**128 experts** → 安全区，vllm-ascend 原生路径直接跑通（w8a8 单芯，PIECEWISE graph）
+- Qwen3.5-35B-A3B：**256 experts** → 安全区
+- 这些模型与 Qwen3-Next **共享同一架构**（Qwen3.5 直接复用 `Qwen3NextSparseMoeBlock`，GDN 参数完全一致：32 v-heads/16 k-heads/256 dim/4 层一全注意力）
+
+**Qwen3-Next-80B 的 512 experts 是全系唯一超出 310P gating tile 容量的**。这解释了"为什么同架构的兄弟模型都好好的"。
+
+### 其他收获（来自 Qwen3-30B-A3B 调优记录）
+
+- 30B-A3B 在 310P 上用 **PIECEWISE graph 模式**跑通（`cudagraph_mode: PIECEWISE`），非 FULL —— Qwen3-Next 的 GDN conv1d 回退冲突可能与 FULL 模式相关，**PIECEWISE 值得试**
+- 它们同样遇到 TransData ~10%、glue 算子 2/3 的问题 —— 与我们的剖析一致
+- E=128 grouped GEMM 在 decode 小 batch 时只有 0.3~0.6 TFLOPS —— A3B 模型 decode 的共性问题
+- torch_npu profiler 在长 prefill 下会 segfault（CANN 9.1）—— 我们用 micro-bench 绕过了
+
+### 可再尝试的优化（参考 Qwen3.5/30B 路径）
+
+1. **PIECEWISE graph 模式**：30B-A3B 的生产配置，Qwen3-Next 值得试（绕 FULL capture 对 conv1d 回退的敏感）
+2. **w8a8 量化**：Qwen3-30B-A3B-w8a8 单芯放得下，Qwen3-Next-80B w8a8 后 ~45GB，TP4 即可，还能减 TransData
+3. **MTP**：Qwen3-Next 权重自带 1553 个 mtp tensors（config 无显式字段，qwen3_next_mtp.py 直接读），仍是单请求延迟的正统解法
