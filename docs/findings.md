@@ -515,3 +515,33 @@ FULL graph 把 per-op 分发从 180us 压到 14us（13 倍），AICore 利用率
 剩余 270ms→25.8ms/token 的构成中，最大的单项是每 token 一次的调度器同步
 （14.7ms），其次是 launch（7.2ms/token）和 allReduce（13ms/token）。
 进一步优化空间：调度器同步与 pipeline 重叠、allReduce 与计算重叠。
+
+## 10 并发场景实测（2026-11-24）
+
+### 当前配置（FULL_DECODE_ONLY[1,2,4], max_num_seqs=4）下 10 并发
+
+| 场景 | 总吞吐 | 每请求平均 | 说明 |
+|---|---|---|---|
+| 10 并发 × 短上下文 (200tok out) | 74.6 tok/s | 7.5 tok/s | batch=4 图命中 + 排队轮转 |
+| 10 并发 × 混合上下文 (690~5458pt) | 29.1 tok/s | 2.9 tok/s | prefill 占比上升 |
+
+### 上下文长度支持
+
+- **硬件/服务上限**：max_model_len=8192（可配置到更大，KV cache 535K tok 可支撑 65 路 8K）
+- **实测通过**：单请求 5458pt prefill 正常（还能更大）
+- **10 并发下的上下文**：每个请求都可以独立使用最大 8192 token 上下文，
+  KV cache 完全够（10×8192=82K << 535K）。限制不在上下文长度，在 decode 并发
+
+### 10 并发的结构性限制
+
+capture_sizes 最大 [1,2,4]（batch≥8 的 graph capture 触发 driver event 耗尽），
+因此 10 并发时 vllm 调度器把请求分成 batch≤4 的批次轮转处理：
+- 吞吐不会因并发数增加而线性提升（4 并发 78.8 → 10 并发 74.6，略降）
+- 每请求分到的 decode 带宽约 7.5 tok/s（短上下文）
+- 长上下文请求 prefill 耗时显著（5458pt prefill 约数秒）
+
+### 提升并发容量的路径
+
+1. **多实例 DP**：起 2-3 个 TP2/TP4 实例（需 W8A8 减小权重），每实例独立 capture
+2. **driver event 资源扩展**：向 CANN 确认 310P capture event 上限能否调大
+3. **上限估算**：若 capture 支持到 batch=16，10 并发可全部命中图，预期总吞吐 100+ tok/s
