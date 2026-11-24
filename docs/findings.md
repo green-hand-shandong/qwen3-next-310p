@@ -415,3 +415,45 @@ event 数量爆炸。48 次 capture event 创建失败。与 30B-A3B 记录"FULL
 ### 启动脚本已同步
 
 仓库 `scripts/start_serve.sh` 此前遗漏更新（仍是 eager 版），已同步为 PIECEWISE 生产配置。
+
+## P0 实验：FULL_DECODE_ONLY 完整矩阵（2026-11-24，采纳评审建议）
+
+### 实验矩阵结果
+
+| 实验 | 模式 | capture_sizes | 启动 | event fail | 单请求 | 并发吞吐 |
+|---|---|---|---|---|---|---|
+| A | FULL_DECODE_ONLY | [1] | ✅ | 0 | 38.8 | 16并发 49.3 |
+| E | FULL_DECODE_ONLY | [1,2] | ✅ | 0 | 38.9 | 2并发 49.6（延迟6s） |
+| **F** | **FULL_DECODE_ONLY** | **[1,2,4]** | ✅ | **0** | **38.2** | **4并发 78.8（延迟8s）** |
+| H | FULL_DECODE_ONLY | [1,2,4,8] | ❌ | 48 | - | - |
+| （对照）FULL_AND_PIECEWISE | [1] | ✅ | 0 | 38.7 | 4并发 13.5（回退） |
+| （对照）FULL_AND_PIECEWISE | [1,2] | ❌ | 48 | - | - |
+
+### 关键结论
+
+1. **评审判断证实**：FULL_AND_PIECEWISE 双模式并存是 event 耗尽的主因——
+   decode FULL 图 + prefill PIECEWISE 图各占一份 event 预算。
+   纯 FULL_DECODE_ONLY（prefill 走 eager）资源占用减半，能容纳 3 个 capture size。
+2. **当前最优生产配置**：`FULL_DECODE_ONLY, capture_sizes=[1,2,4], max_num_seqs=4`
+   - 单请求 38.2 tok/s
+   - 4 并发 78.8 tok/s（平均延迟 8s）—— **比此前所有配置都快**
+   - batch=4 图命中；batch≥8（capture 未覆盖）回退 eager，且 [1,2,4,8] event 耗尽
+3. **FULL_DECODE_ONLY 语义**：decode 走 FULL 图，prefill 走 eager。
+   prefill 图不 capture 反而省 event；prefill 的 849ms TTFT 与其他模式持平。
+
+### 与旧配置对比
+
+| 配置 | 单请求 | 4并发 | 16并发 |
+|---|---|---|---|
+| eager（最初） | 3.7 | ~13 | ~13 |
+| PIECEWISE[1,2,4] | 13.2 | 41.7 | — |
+| FULL_AND_PIECEWISE[1] | 38.7 | 13.5 | 49.3 |
+| **FULL_DECODE_ONLY[1,2,4]** | **38.2** | **78.8** | 48.7（回退） |
+
+### event 资源机制推断
+
+- FULL_AND_PIECEWISE[1]：decode FULL 图 1 个 + prefill PW 图 1 个 = 2 套 event
+- FULL_DECODE_ONLY[1,2,4]：decode FULL 图 3 个 + prefill 无 = 3 套 event ≈ 前者 1.5 倍？
+  实际 [1,2] 就 0 fail 而 FAP[1,2] 48 fail —— 说明 PW prefill 图的 event 消耗
+  远大于 FULL decode 图（PW 图按 splitting_ops 切成 ~96 个子图，每子图独立 event）
+- 精确 event 计数需要 driver 层工具，当前为行为推断
