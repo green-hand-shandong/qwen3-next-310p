@@ -19,8 +19,9 @@
 | 模型 | Qwen3-Next-80B-A3B-Instruct（512 experts MoE，48 层，GDN 线性注意力） |
 | 硬件 | Atlas 300I Duo × 4 卡（8芯片，TP8） |
 | 软件 | vllm-ascend v0.32.0rc1-310p 镜像 |
-| 单请求 decode | ~3 tok/s（enforce-eager） |
-| 16 并发聚合吞吐 | 51 tok/s（引擎峰值 56 tok/s） |
+| 单请求 decode（FULL graph） | **38.7 tok/s**（eager 3.7 的 10.5 倍） |
+| 4 并发聚合吞吐（FULL_DECODE_ONLY） | **78.8 tok/s**（平均延迟 8s） |
+| 10 并发聚合吞吐 | 74.6 tok/s（排队轮转） |
 | 多轮对话正确性 | ✅（7→×6=42→×2=84 连续推理正确） |
 | Prefix caching | ✅ 长前缀二次请求提速 ~30% |
 | 服务稳定性 | 0 ERROR 持续运行 |
@@ -47,7 +48,7 @@
 
 - **必须用 bridge 网络**：`--net=host` 下 HCCL 初始化失败（error 19, call network api fail）
 - **容器级注入 `ASCEND_RT_VISIBLE_DEVICES`**：`docker exec` 内的环境变量不会传给 worker 子进程
-- **必须 `--enforce-eager`**：aclgraph capture 对 GDN 的 conv1d PyTorch 回退路径失败（error 507903, rtStreamEndCapture）
+- **必须 `FULL_DECODE_ONLY` graph mode**：aclgraph capture 对 GDN 的 conv1d PyTorch 回退路径失败（error 507903, rtStreamEndCapture）
 - 310P 上 `npu_moe_gating_top_k_softmax` 的 UB 容量限制是硬件性的，软件规避只能换实现
 
 ### 快速开始
@@ -108,7 +109,7 @@ curl http://localhost:8320/v1/chat/completions \
 
 ### 已知限制
 
-- 单请求 decode ~3 tok/s：eager 模式无图优化，受 310P 算力限制；并发可线性扩展
+- 图模式 capture_sizes 上限 [1,2,4]：batch≥8 的 graph capture 触发 310P driver event 资源耗尽（507903），高并发需多实例扩展
 - MTP 投机解码：需先重编 v310 算子 host 库（0001 补丁），暂不可用
 - 图模式（aclgraph）：与 GDN conv1d 回退路径冲突，必须 enforce-eager
 - 镜像内 `vllm_ascend/_cann_ops_custom` 的 kernel 是预编译 .o，改源码需走完整 CMake 构建
@@ -140,8 +141,9 @@ A complete, working recipe for running **Qwen3-Next-80B-A3B** (hybrid linear att
 | Model | Qwen3-Next-80B-A3B-Instruct (512-expert MoE, 48 layers, GDN linear attention) |
 | Hardware | Atlas 300I Duo × 4 cards (8 chips, TP8) |
 | Software | vllm-ascend v0.32.0rc1-310p image |
-| Single-request decode | ~3 tok/s (enforce-eager) |
-| 16-way concurrent throughput | 51 tok/s aggregate (56 tok/s engine peak) |
+| Single-request decode (FULL graph) | **38.7 tok/s** (10.5x over eager 3.7) |
+| 4-way concurrent (FULL_DECODE_ONLY) | **78.8 tok/s** aggregate (8s avg latency) |
+| 10-way concurrent | 74.6 tok/s aggregate (queued rotation) |
 | Multi-turn correctness | ✅ (7→×6=42→×2=84 chained reasoning correct) |
 | Prefix caching | ✅ ~30% faster on repeated long prefixes |
 | Service stability | 0 ERROR under sustained load |
@@ -168,7 +170,7 @@ In multi-turn / MTP speculative decoding scenarios, `aclnnRecurrentGatedDeltaRul
 
 - **Bridge network is mandatory**: HCCL init fails under `--net=host` (error 19, call network api fail)
 - **Inject `ASCEND_RT_VISIBLE_DEVICES` at container level**: env vars from `docker exec` do not propagate to worker subprocesses
-- **`--enforce-eager` is mandatory**: aclgraph capture fails on GDN's conv1d PyTorch fallback (error 507903, rtStreamEndCapture)
+- **`FULL_DECODE_ONLY` graph mode is mandatory**: aclgraph capture fails on GDN's conv1d PyTorch fallback (error 507903, rtStreamEndCapture)
 - The UB-capacity limit of `npu_moe_gating_top_k_softmax` on 310P is hardware-level; software mitigation requires a different implementation
 
 ### Quick Start
@@ -229,7 +231,7 @@ curl http://localhost:8320/v1/chat/completions \
 
 ### Known Limitations
 
-- Single-request decode ~3 tok/s: eager mode without graph optimization, bounded by 310P compute; scales linearly with concurrency
+- Graph capture_sizes capped at [1,2,4]: batch>=8 graph capture triggers 310P driver event exhaustion (507903); scale out with multiple instances for higher concurrency
 - MTP speculative decoding: requires rebuilding the v310 operator host library (patch 0001); not yet available
 - Graph mode (aclgraph): conflicts with GDN conv1d fallback path; enforce-eager required
 - Kernels in `vllm_ascend/_cann_ops_custom` inside the image are prebuilt `.o` files; source changes require a full CMake build
