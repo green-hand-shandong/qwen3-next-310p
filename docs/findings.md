@@ -576,3 +576,17 @@ capture_sizes 最大 [1,2,4]（batch≥8 的 graph capture 触发 driver event �
 - 310P 显存带宽 204GB/s/芯（TP8 聚合 1632GB/s）是硬上限
 - 理论带宽模型 272 tok/s（TP8 聚合），当前 38.7 为其 14%，
   损耗主因是 TP8 通信（96 次 allReduce/token）和小 kernel 效率
+
+## 上游 PR 提交（2026-11-24）
+
+**PR #23076**: https://github.com/vllm-project/vllm-ascend/pull/23076
+标题: [BugFix][310P] Fix MoE gating crash for >64-expert MoE models (Qwen3-Next-80B-A3B)
+
+提交内容：gating 512E 修复（纯 torch softmax+topk 替换），基于 upstream/main。
+
+CI 状态演进：
+1. 首次：pre-commit 失败（PR 标题前缀 [310P] 不合规）→ 改为 [BugFix][310P]
+2. 修复后：pre-commit 通过（ruff 自动移除未用的 torch_npu import）、cpu-ut 通过、DCO 通过
+3. 剩余：CODEOWNERS 审批（@Tflowers-0129 / @YangShuai52）+ maintainer 加 ready-precise label
+
+已留言请 maintainer 审阅。
