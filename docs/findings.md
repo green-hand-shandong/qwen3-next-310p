@@ -334,3 +334,45 @@ batch≤4 全部正常。疑似 310P driver 对 capture 图规模的限制（30B
 3. torchair/npugraph_ex — 310P hardware profile 未支持（`npugraph_ex` capability 缺失）
 
 结论：PIECEWISE 是当前唯一可用且效果最好的 non-eager 方案。
+
+## FULL graph 模式修正与最终模式选择（2026-11-24）
+
+### 修正一个错误结论
+
+之前记录"FULL 失败是因为 GDN conv1d PyTorch 回退破坏 capture"——**这个判断错了**。
+检查 gdn_310.py 发现 vllm-ascend 0.32 的 GDN decode 路径 conv1d **已经用 AscendC 算子**
+（`torch.ops._C_ascend.npu_causal_conv1d_310`），不存在回退。
+
+FULL_AND_PIECEWISE 模式失败的真实原因（serve_full2.log 实锤）：
+```
+Create capture event failed, stream_id=[9->372], error=117571609
+```
+**310P driver 的 capture event 资源耗尽**——FULL 模式每层一个图 × 48 层 + 多 stream 交互，
+event 数量爆炸。48 次 capture event 创建失败。与 30B-A3B 记录"FULL/TP=2 捕获 event
+资源不足"完全一致。
+
+### FULL 模式实测（capture_sizes=[1] 时能启动）
+
+| 模式 | 单请求 decode | 4 并发 |
+|---|---|---|
+| eager | 3.7 tok/s | ~13 tok/s |
+| PIECEWISE [1,2,4] | 13.2 tok/s | **41.7 tok/s** |
+| FULL [1] | **38.7 tok/s（10.5x）** | 13.5 tok/s（batch>1 无图回退） |
+
+- FULL[1] 只 capture batch=1：单请求 38.7 tok/s（比 PIECEWISE 快 3 倍）
+- 但 batch=2/4 无图命中回退 eager，2 并发反而掉到 6.6 tok/s
+- capture_sizes=[1,2] 就 event 耗尽（48 次 fail）——FULL 模式 event 预算只够 1 个图
+
+### 最终选择建议
+
+| 场景 | 推荐模式 |
+|---|---|
+| 单请求/低并发流式（≤2路） | FULL_AND_PIECEWISE + capture_sizes=[1]（38.7 tok/s） |
+| 并发服务（3-4路） | PIECEWISE + [1,2,4]（41.7 tok/s @ 4并发） |
+| 更高并发 | 多实例数据并行（TP4×2） |
+
+### event 资源问题可尝试的缓解
+
+- `HCCL_OP_EXPANSION_MODE` / driver event 上限调优（需查 310P driver 文档）
+- 向 CANN 提 issue：请求增大 capture event 资源池
+- 上游 vllm-ascend issue：FULL 模式减少 per-layer 图数量（合并 capture）
