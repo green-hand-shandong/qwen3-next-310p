@@ -457,3 +457,61 @@ event 数量爆炸。48 次 capture event 创建失败。与 30B-A3B 记录"FULL
   实际 [1,2] 就 0 fail 而 FAP[1,2] 48 fail —— 说明 PW prefill 图的 event 消耗
   远大于 FULL decode 图（PW 图按 splitting_ops 切成 ~96 个子图，每子图独立 event）
 - 精确 event 计数需要 driver 层工具，当前为行为推断
+
+## FULL Graph 模式 msprof 剖析（2026-11-24，50 tok decode，rank0）
+
+### 采集方法
+
+vllm 0.32 内置 profiler（`--profiler-config '{"profiler":"torch","torch_profiler_dir":"...","torch_profiler_activities":["CPU","PrivateUse1"]}'`）
++ `msprof --export=on` 解析 rank 目录的 aicore 原始数据 → op_statistic / api_statistic CSV。
+（msprof application 模式对 multiproc worker 不可用：dynamic profiling socket 连接超时；
+msprof --pid 在容器内也报 no valid pid。torch profiler HTTP 接口是可行路径。）
+
+### NPU 利用率对比（npu-smi watch，decode 持续负载）
+
+| 模式 | AICore avg | 峰值 | MemBW |
+|---|---|---|---|
+| eager | 5.3% | 7% | ~2% |
+| **FULL_DECODE_ONLY** | **9.8~13.1%** | **61%** | **最高 20.7%** |
+
+### rank0 device 算子统计（50 tok，总计 1202ms）
+
+| 算子 | 次数 | 总ms | 均us | 占比 |
+|---|---|---|---|---|
+| GroupedMatmul | 4800 | 486.6 | 101.4 | 40.5% |
+| MatMulV2 | 16250 | 232.8 | 14.3 | 19.4% |
+| **TransData** | **23174** | **82.3** | 3.6 | 6.8% |
+| Cast | 23135 | 54.6 | 2.4 | 4.5% |
+| RmsNorm | 11450 | 35.4 | 3.1 | 2.9% |
+| RecurrentGatedDeltaRuleV310 | 1764 | 20.9 | 11.8 | 1.7% |
+| MoeInitRouting/Unpermute | 4800 | 38.7 | - | 3.2% |
+
+**关键数字**：
+- GroupedMatmul 4800 次 = 50 tok × 48 层 × 2 (gmm1+gmm2)，单次 101us
+- TransData 23174 次 / 82ms —— graph 模式下仍在发生（每层多个），但单次仅 3.6us
+  （eager 微基准里 143us 是含同步的端到端时间；graph 内批量流水后单次开销大降）
+- RecurrentGatedDeltaRuleV310 单次 11.8us —— AscendC 算子本身极快
+
+### rank0 host API 统计（总计 2460ms）
+
+| API | 次数 | 总ms | 均us |
+|---|---|---|---|
+| aclrtSynchronizeEvent | 50 | 733.6 | 14673 |
+| launch（kernel 下发） | 25452 | 360.1 | 14.2 |
+| aclnnInplaceCopy | 9173 | 177.1 | 19.3 |
+| aclrtSynchronizeStream | 36 | 162.7 | 4519 |
+| hcom_allReduce | 97 | 62.7 | 646.6 |
+
+**FULL graph 下的剩余瓶颈**：
+1. aclrtSynchronizeEvent 50 次 733ms —— 每 token 一次大同步（14.7ms/次），
+   这是调度器级别的强制同步（每 token 等待图执行完），不是图内部开销
+2. launch 25452 次 360ms —— 图 replay 时 host 仍需逐 kernel 下发（310P 不支持
+   整图 device 端自执行），但单次降到 14.2us（eager 时约 180us）
+3. allReduce 97 次 646us/次 —— TP8 通信延迟，96 次/token 预期吻合
+
+### 结论
+
+FULL graph 把 per-op 分发从 180us 压到 14us（13 倍），AICore 利用率翻倍。
+剩余 270ms→25.8ms/token 的构成中，最大的单项是每 token 一次的调度器同步
+（14.7ms），其次是 launch（7.2ms/token）和 allReduce（13ms/token）。
+进一步优化空间：调度器同步与 pipeline 重叠、allReduce 与计算重叠。
