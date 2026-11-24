@@ -545,3 +545,34 @@ capture_sizes 最大 [1,2,4]（batch≥8 的 graph capture 触发 driver event �
 1. **多实例 DP**：起 2-3 个 TP2/TP4 实例（需 W8A8 减小权重），每实例独立 capture
 2. **driver event 资源扩展**：向 CANN 确认 310P capture event 上限能否调大
 3. **上限估算**：若 capture 支持到 batch=16，10 并发可全部命中图，预期总吞吐 100+ tok/s
+
+## 非量化优化空间终判（2026-11-24）
+
+### 决定性实验：离线 LLM API（绕过 HTTP/detokenizer/IPC）
+
+离线 LLM 400tok 含 prefill：34.7 tok/s —— 与在线服务（38.2 tok/s 流式）持平甚至略低。
+**结论：HTTP、detokenizer、IPC 的开销已可忽略，引擎在该配置下已接近极限。**
+
+### 补充实验
+
+- `--async-scheduling`：min ITL 从 8ms 降到 4ms（graph replay 纯耗时），
+  但 P50 仍 26ms —— 流式间隔由调度循环决定，overlap 收益有限
+- ITL 分布（FULL graph）：P50 26ms / P90 41ms / min 4ms
+
+### 非量化优化路径终判
+
+已挖尽：
+- FULL graph（dispatch 180us→14.2us，13 倍）
+- async_scheduling（边际收益）
+- 离线验证（确认框架开销已最小）
+
+剩余可尝试（收益递减）：
+1. TopK→Softmax 路由数学优化（norm_topk_prob=true 时语义等价可证）：
+   gating 链 0.17ms/层 × 48 = 8ms/tok 中省约一半 → 预期 +10-15%
+2. MTP 投机解码（预期 1.4-2x，需 0001 补丁重编）
+3. n-gram/prompt-lookup 投机（vllm 原生，无需 draft 模型，零构建成本）——**下一个最低成本实验**
+
+不可软件解决：
+- 310P 显存带宽 204GB/s/芯（TP8 聚合 1632GB/s）是硬上限
+- 理论带宽模型 272 tok/s（TP8 聚合），当前 38.7 为其 14%，
+  损耗主因是 TP8 通信（96 次 allReduce/token）和小 kernel 效率
