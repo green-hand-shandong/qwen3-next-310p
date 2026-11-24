@@ -376,3 +376,42 @@ event 数量爆炸。48 次 capture event 创建失败。与 30B-A3B 记录"FULL
 - `HCCL_OP_EXPANSION_MODE` / driver event 上限调优（需查 310P driver 文档）
 - 向 CANN 提 issue：请求增大 capture event 资源池
 - 上游 vllm-ascend issue：FULL 模式减少 per-layer 图数量（合并 capture）
+
+## 评审修正（2026-11-24，外部评审意见采纳）
+
+### 表述修正
+
+1. **"gating 上限约 466"** → 精确表述：实测 E=464 通过、E=468 失败（k=10, tokens=8），
+   边界在 464~468 之间；其他 k/tokens 组合未完整扫描，不排除边界随参数浮动。
+   E=80/96/112/128/160/192/256/320/384/448 通过（16 对齐），65~78、84~92、104、120 失败（非 16 对齐）。
+
+2. **"AICore 5.3% = 95% 时间等 CPU"** → 低利用率是必要非充分证据。
+   与 30B-A3B msprof 的 host 下发占比 18%、单 stream 忙碌占空比 12.3% 交叉印证了
+   CPU 主导，但 5.3% 与 94.7% 之间还包含 kernel 执行、排队、DMA 等其他成分，
+   精确比例需要 Host/Device Timeline 对齐分析（待做）。
+
+3. **"docker exec 环境变量不传给子进程"** → 准确描述：vllm 的 multiproc worker 使用
+   spawn 方式启动，`docker exec -d` 里手动 export 的变量在 nohup+bash -c 链路中
+   未能可靠传递到 EngineCore 子进程；`docker run -e` 注入则稳定。根因是
+   vllm worker 的环境继承链，不是 Docker 通用行为。
+
+4. **"310P 必须 bridge 网络"** → 仅在本机验证了 host 网络失败（HCCL error 19）。
+   未排查具体 HCCL 接口/IP 配置（如 hccn.conf 为空、网卡路由），不能外推为
+   310P 通用结论。
+
+5. **"v2 算子只差 op-plugin 分发"** → 需补充确认：310P 的 kernel 二进制、tiling
+   实现是否已在 libcust 包中就位。目前仅验证了 op-plugin 调用层报错。
+
+6. **"FULL 崩溃是驱动缺陷"** → 修正为：driver capture event 资源耗尽（117571609）。
+   是"资源硬限制/框架重复申请"还是"驱动泄漏"未区分——FULL_AND_PIECEWISE 双模式
+   并存时 event 消耗更大，切换到纯 FULL_DECODE_ONLY 可能降低占用（待实验）。
+
+7. **"稳定运行 4 天 0 ERROR"** → 补充：期间为低强度功能验证流量（数十次请求），
+   非持续压测；未监控显存增长曲线。生产结论需补压测。
+
+8. **"38.7 tok/s 可服务"** → 区分：FULL[1] 是单请求实验配置（max_num_seqs=1 语义）；
+   生产服务配置为 PIECEWISE[1,2,4]（13.2 tok/s 单请求 / 41.7 tok/s @ 4 并发）。
+
+### 启动脚本已同步
+
+仓库 `scripts/start_serve.sh` 此前遗漏更新（仍是 eager 版），已同步为 PIECEWISE 生产配置。
