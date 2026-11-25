@@ -590,3 +590,37 @@ CI 状态演进：
 3. 剩余：CODEOWNERS 审批（@Tflowers-0129 / @YangShuai52）+ maintainer 加 ready-precise label
 
 已留言请 maintainer 审阅。
+
+## 补充：torch softmax+topk 替换的等效性与性能（2026-11-25）
+
+### 等效性验证（E=448，原生算子可用区内直接对照）
+
+- **index 一致率: 100%**（scatter 建稀疏向量后逐位置对比，无 tie-breaking 差异）
+- **共同位置权重差: 0.0**（严格相等，fp16 精度内无偏差）
+- renorm 后同样严格相等
+
+数学上：`npu_moe_gating_top_k_softmax` 内部就是 softmax(z)→topk，
+与 torch 版 `softmax(z)→topk` 同序同精度（torch 版中间值用 fp32 更准）。
+`norm_topk_prob=true` 的 renorm 步骤两者共用同一实现。
+
+之前一次对照显示 74% 差异，是对照脚本自身的 gather 对齐 bug，已修正。
+
+### 性能开销
+
+| 实现 | batch=4 单次 | 48 层/token |
+|---|---|---|
+| torch softmax+topk (E=512) | 0.221 ms | 10.6 ms |
+| 原生 AscendC (E=448) | 0.059 ms | 2.8 ms |
+
+torch 版比原生慢 ~0.16ms/层，48 层合计 +7.8ms/token。
+在 FULL graph 的 25.8ms/token 中占比 30%——**是可感知但非主导的开销**。
+
+### 为什么不开发 AscendC 算子
+
+1. 原生 310P kernel 的 UB 无分块逻辑是根因；写一个支持 E=512 的 AscendC 算子
+   需要重编 CANN built-in 包（构建链在容器内不可用，见前文）
+2. torch softmax+topk 用的都是 ATB/原生 NPU 算子（SoftmaxV2、TopKV2），
+   不是纯 CPU 计算——device 侧执行，只是多了 2-3 次 kernel 分发
+3. 收益/成本比：自研 AscendC 算子约省 7.8ms/token（+30% TPOT），
+   但需要算子开发+构建链+维护；而 MTP（1.4-2x）和 W8A8（带宽减半）收益更大
+4. CANN 适配 v2 算子后此补丁可整体回退（PR 中已注明）
