@@ -624,3 +624,44 @@ torch 版比原生慢 ~0.16ms/层，48 层合计 +7.8ms/token。
 3. 收益/成本比：自研 AscendC 算子约省 7.8ms/token（+30% TPOT），
    但需要算子开发+构建链+维护；而 MTP（1.4-2x）和 W8A8（带宽减半）收益更大
 4. CANN 适配 v2 算子后此补丁可整体回退（PR 中已注明）
+
+## 构建链打通 + MTP 实测（2026-11-25）
+
+### 构建链问题彻底解决
+
+之前"构建链断裂"的判断需要修正：**csrc 构建链本身是好的**，失败原因有两层：
+1. `build.sh --pkg`（打 run 包）模式有独立问题（symbol 生成等）—— 但这不是必需路径
+2. 我们手工配置 csrc/build 用了 Unix Makefiles，与 build_aclnn.sh 期望的 Ninja 冲突
+
+正确路径：`pip install -e . --no-build-isolation --no-deps` 一条命令完成
+（内部自动跑 build_aclnn.sh 编 4 个 v310 AscendC 算子 + vllm_ascend_C.so）。
+前置条件：清掉手动配置的 csrc/build 残留。
+
+### 0001 状态表补丁已成功编入
+
+- csrc 部分（tiling.cpp/kernel.h/tiling_data.h）干净应用
+- python 部分（gdn_310.py 2D indices 分支）之前已应用
+- libcust_opapi.so / libcust_opmaster.so 重编完成（build_aclnn.sh 成功）
+
+### MTP 实测结果
+
+配置：FULL_DECODE_ONLY[1,2,4] + MTP1（num_speculative_tokens=1）
+
+| 项 | 结果 |
+|---|---|
+| 启动 | ✅ 0 ERROR（之前崩溃，0001 补丁生效） |
+| decode | 40.9 tok/s（无 MTP 38.7，仅 +5.7%） |
+| 正确性 | ❌ 17²+256 答 425（应 545）——MTP 接受/回滚逻辑有 bug |
+
+### MTP 收益低 + 正确性问题的分析
+
+1. 收益低：FULL graph 下每 token 25.8ms 中 replay 只占 ~8ms，
+   MTP 需要额外跑一次 draft forward（+~8ms）才能省一次 verify，
+   图模式下 draft+verify 的收益被固定开销稀释
+2. 正确性错误表明 0001 补丁虽然修了 kernel 侧状态回写，
+   但 vllm 调度器侧的 MTP 状态管理可能还有其他问题（或补丁不完整）
+
+### 决策
+
+- **生产配置保持无 MTP**（FULL_DECODE_ONLY[1,2,4]，38.7 tok/s，正确性已验证）
+- MTP 作为后续专项：需对比 910B 上同模型的 MTP 行为，排查是 310P 特有还是通用问题
